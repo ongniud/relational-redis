@@ -4,12 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 	"time"
 
-	redis "github.com/go-redis/redis/v8"
+	"github.com/go-redis/redis/v8"
 )
 
 // ColumnType represents supported data types for table columns
@@ -390,7 +389,7 @@ func (r *Database) Update(ctx context.Context, table string, rowID int64, data m
 // Get retrieves a single row by its ID
 func (r *Database) Get(ctx context.Context, table string, rowID int64) (map[string]interface{}, error) {
 	exists, err := r.TableExists(ctx, table)
-	if err != nil ||!exists {
+	if err != nil || !exists {
 		return nil, fmt.Errorf("table %s does not exist", table)
 	}
 
@@ -459,11 +458,183 @@ func (r *Database) GetByUniqueIndex(ctx context.Context, table, column string, v
 	return r.Get(ctx, table, int64(rowID))
 }
 
-// Delete removes a row and all its indexes atomically
+// Delete removes a row and all its indexes atomically.
 func (r *Database) Delete(ctx context.Context, table string, rowID int64) error {
+	// Check if the table exists.
 	schema, err := r.GetTableSchema(ctx, table)
 	if err != nil {
 		return fmt.Errorf("table %s does not exist", table)
 	}
 
-	rowidIndexKey := fmt.Sprintf(TableUniqueIndexKeyTemplate, table,
+	// Check if the rowID exists in the unique index.
+	rowidIndexKey := fmt.Sprintf(TableUniqueIndexKeyTemplate, table, TableRowIDColumn)
+	_, err = r.client.ZScore(ctx, rowidIndexKey, fmt.Sprintf("%d", rowID)).Result()
+	if err == redis.Nil {
+		return fmt.Errorf("rowid %d not found in _rowid index", rowID)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to check _rowid index: %v", err)
+	}
+
+	// Get the row data for index cleanup.
+	rowKey := fmt.Sprintf(DataRowKeyTemplate, table, rowID)
+	rowData, err := r.client.HGetAll(ctx, rowKey).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get row data: %v", err)
+	}
+	if len(rowData) == 0 {
+		return fmt.Errorf("row data not found (but index exists)")
+	}
+
+	// Atomically delete the row and its indexes.
+	_, err = r.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		// Delete the main row data.
+		pipe.Del(ctx, rowKey)
+
+		// Delete all indexes.
+		for _, idx := range schema.Indexes {
+			colValue, exists := rowData[idx.Column]
+			if !exists {
+				continue
+			}
+
+			switch {
+			case idx.IsUnique:
+				// Unique index: member = column value string, score = rowID
+				idxKey := fmt.Sprintf(TableUniqueIndexKeyTemplate, table, idx.Column)
+				pipe.ZRem(ctx, idxKey, fmt.Sprintf("%v", colValue))
+			case idx.IsNumeric:
+				// Numeric index: member = rowID, score = column value
+				idxKey := fmt.Sprintf(TableNumericIndexKeyTemplate, table, idx.Column)
+				pipe.ZRem(ctx, idxKey, rowID)
+			}
+		}
+
+		// Clean up the special _rowid index.
+		pipe.ZRem(ctx, rowidIndexKey, fmt.Sprintf("%d", rowID))
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to execute delete transaction: %v", err)
+	}
+	return nil
+}
+
+// DumpTable formats and prints the table schema and data.
+func (r *Database) DumpTable(ctx context.Context, table string) (string, error) {
+	// Get the table schema.
+	schema, err := r.GetTableSchema(ctx, table)
+	if err != nil {
+		return "", fmt.Errorf("failed to get table schema: %v", err)
+	}
+
+	// Get all row IDs.
+	rowIDIndexKey := fmt.Sprintf(TableUniqueIndexKeyTemplate, table, TableRowIDColumn)
+	rowIDs, err := r.client.ZRange(ctx, rowIDIndexKey, 0, -1).Result()
+	if err != nil {
+		return "", fmt.Errorf("failed to get row IDs: %v", err)
+	}
+
+	// Build the output.
+	var output strings.Builder
+
+	// Output the table schema.
+	output.WriteString(fmt.Sprintf("=== Table Schema: %s ===\n", table))
+	output.WriteString(fmt.Sprintf("Created At: %s\n", time.Unix(schema.CreatedAt, 0).Format(time.RFC3339)))
+
+	// Output column definitions.
+	output.WriteString("\nColumns:\n")
+	for _, col := range schema.Columns {
+		notNull := ""
+		if col.NotNull {
+			notNull = " NOT NULL"
+		}
+		defaultValue := ""
+		if col.DefaultValue != nil {
+			defaultValue = fmt.Sprintf(" DEFAULT %v", col.DefaultValue)
+		}
+		output.WriteString(fmt.Sprintf("- %s %s%s%s\n",
+			col.Name,
+			col.Type,
+			notNull,
+			defaultValue))
+	}
+
+	// Output indexes.
+	output.WriteString("\nIndexes:\n")
+	for _, idx := range schema.Indexes {
+		indexType := "INDEX"
+		if idx.IsUnique {
+			indexType = "UNIQUE INDEX"
+		} else if idx.IsNumeric {
+			indexType = "NUMERIC INDEX"
+		}
+		output.WriteString(fmt.Sprintf("- %s ON %s\n", indexType, idx.Column))
+	}
+
+	// Output data rows.
+	output.WriteString(fmt.Sprintf("\n=== Data Rows (%d) ===\n", len(rowIDs)))
+	for _, rowIDStr := range rowIDs {
+		rowID, _ := strconv.ParseInt(rowIDStr, 10, 64)
+		rowKey := fmt.Sprintf(DataRowKeyTemplate, table, rowID)
+
+		// Get the row data.
+		rowData, err := r.client.HGetAll(ctx, rowKey).Result()
+		if err != nil {
+			return "", fmt.Errorf("failed to get row %d: %v", rowID, err)
+		}
+
+		// Format the row data.
+		output.WriteString(fmt.Sprintf("\nRow ID: %d\n", rowID))
+		for _, col := range schema.Columns {
+			value := rowData[col.Name]
+			if value == "" {
+				value = "NULL"
+			}
+			output.WriteString(fmt.Sprintf("  %-15s: %s\n", col.Name, value))
+		}
+	}
+
+	return output.String(), nil
+}
+
+// Helper function to convert interface{} to float64 for numeric indexing
+func parseFloat(value interface{}) float64 {
+	switch v := value.(type) {
+	case int:
+		return float64(v)
+	case float64:
+		return v
+	case string:
+		f, _ := strconv.ParseFloat(v, 64)
+		return f
+	default:
+		return 0
+	}
+}
+
+// Helper function to convert string values to proper types based on column definition
+func convertValueByType(raw string, colType ColumnType) (interface{}, error) {
+	switch colType {
+	case ColumnTypeInt:
+		i, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, err
+		}
+		return int64(i), nil
+	case ColumnTypeString:
+		return raw, nil
+	case ColumnTypeFloat:
+		return strconv.ParseFloat(raw, 64)
+	case ColumnTypeBool:
+		return strconv.ParseBool(raw)
+	case ColumnTypeJSON:
+		var result interface{}
+		err := json.Unmarshal([]byte(raw), &result)
+		return result, err
+	default:
+		return nil, fmt.Errorf("unsupported column type: %s", colType)
+	}
+}
