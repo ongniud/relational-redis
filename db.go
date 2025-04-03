@@ -1,4 +1,4 @@
-package redisql
+package relational_redis
 
 import (
 	"context"
@@ -28,7 +28,7 @@ const (
 	TableRowIDCounterKeyTemplate = "counter:%s:rowid"     // Row ID counter key
 	TableUniqueIndexKeyTemplate  = "idx:%s:unique:%s"     // Unique index key (table, column)
 	TableNumericIndexKeyTemplate = "idx:%s:numeric:%s"    // Numeric index key (table, column)
-	DataRowKeyTemplate           = "data:table:%s:row:%d" // Data row key (table, rowID)
+	TableDataRowKeyTemplate      = "data:table:%s:row:%d" // Data row key (table, rowID)
 	TableRowIDColumn             = "_rowid"               // Special column name for row IDs
 )
 
@@ -174,7 +174,7 @@ func (r *Database) DropTable(ctx context.Context, table string) error {
 		if err != nil {
 			return err
 		}
-		rowKey := fmt.Sprintf(DataRowKeyTemplate, table, rid)
+		rowKey := fmt.Sprintf(TableDataRowKeyTemplate, table, rid)
 		keysToDelete = append(keysToDelete, rowKey)
 	}
 
@@ -292,7 +292,7 @@ func (r *Database) Insert(ctx context.Context, table string, data map[string]int
 	rowData[TableRowIDColumn] = rowID
 
 	_, err = r.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-		rowKey := fmt.Sprintf(DataRowKeyTemplate, table, rowID)
+		rowKey := fmt.Sprintf(TableDataRowKeyTemplate, table, rowID)
 		var args []interface{}
 		for col, value := range rowData {
 			args = append(args, col, value)
@@ -335,7 +335,7 @@ func (r *Database) Update(ctx context.Context, table string, rowID int64, data m
 	if err != nil {
 		return err
 	}
-	rowKey := fmt.Sprintf(DataRowKeyTemplate, table, rowID)
+	rowKey := fmt.Sprintf(TableDataRowKeyTemplate, table, rowID)
 	oldData, err := r.client.HGetAll(ctx, rowKey).Result()
 	if err != nil {
 		return fmt.Errorf("row not found: %v", err)
@@ -393,7 +393,7 @@ func (r *Database) Get(ctx context.Context, table string, rowID int64) (map[stri
 		return nil, fmt.Errorf("table %s does not exist", table)
 	}
 
-	rowKey := fmt.Sprintf(DataRowKeyTemplate, table, rowID)
+	rowKey := fmt.Sprintf(TableDataRowKeyTemplate, table, rowID)
 	data, err := r.client.HGetAll(ctx, rowKey).Result()
 	if err != nil {
 		if err == redis.Nil {
@@ -477,7 +477,7 @@ func (r *Database) Delete(ctx context.Context, table string, rowID int64) error 
 	}
 
 	// Get the row data for index cleanup.
-	rowKey := fmt.Sprintf(DataRowKeyTemplate, table, rowID)
+	rowKey := fmt.Sprintf(TableDataRowKeyTemplate, table, rowID)
 	rowData, err := r.client.HGetAll(ctx, rowKey).Result()
 	if err != nil {
 		return fmt.Errorf("failed to get row data: %v", err)
@@ -578,7 +578,7 @@ func (r *Database) DumpTable(ctx context.Context, table string) (string, error) 
 	output.WriteString(fmt.Sprintf("\n=== Data Rows (%d) ===\n", len(rowIDs)))
 	for _, rowIDStr := range rowIDs {
 		rowID, _ := strconv.ParseInt(rowIDStr, 10, 64)
-		rowKey := fmt.Sprintf(DataRowKeyTemplate, table, rowID)
+		rowKey := fmt.Sprintf(TableDataRowKeyTemplate, table, rowID)
 
 		// Get the row data.
 		rowData, err := r.client.HGetAll(ctx, rowKey).Result()

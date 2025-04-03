@@ -1,4 +1,4 @@
-module github.com/blastbao/_snippets/database/redis-rdms
+module github.com/ongniud/relational-redis
 
 go 1.22.3
 
